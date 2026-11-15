@@ -6,6 +6,35 @@ A causal feature library for multi-index equity panels: returns, trend, volatili
 
 It started as feature work on two emerging-market index panels, which I audited and rebuilt into one market-agnostic package. One panel had every index with full OHLC and a volatility index on the same exchange. The other had closes only, plus a volatility index computed on a foreign exchange. The original index data is third-party and is **not** in this repo, not even as a sample. Everything here runs on a **synthetic generator with the same index names and columns**, and you can point it at your own CSVs.
 
+## What problem this solves
+
+A model that predicts index returns needs many input features, built the same way for every index, and none of them may use information that was not available when the trade is placed. Two subtle timing mistakes make that hard: pairing a close-of-day feature with the same day's return, and joining a series from another exchange that closes later than yours. This library builds a wide, de-duplicated feature matrix for any panel of index CSVs and tests that both mistakes are gone.
+
+## What you will learn
+
+- How to organise a large feature library as small, ordered, additive modules.
+- How to join a series from another exchange's calendar with a strict as-of join, and why a same-date join leaks.
+- Why a truncation test cannot catch a same-day leak, and how a perturbation test does.
+- How a decision lag turns "as of the close of t" features into ones you can safely pair with day t's return.
+- How to stop a forward fill from hiding a long outage.
+- How to find features that are just rescaled copies of each other (affine duplicates).
+- How to scan your own source code (AST) for patterns that leak, like `shift(-1)` or `center=True`.
+
+## Key concepts
+
+- **Panel:** many indices side by side, one row per trading day.
+- **Causal feature:** a value on row t computed only from rows up to t.
+- **Look-ahead bias:** using data that was not yet available when the decision is made.
+- **Decision lag:** shift every feature down by one row, so row t uses data up to t-1 and can predict day t's return.
+- **As-of join:** for each local date, take the latest value from another series dated before it. "Strict" means dated strictly before, never on the same date.
+- **Point-in-time / publication lag:** a value sits on the row where it became known, k rows after its reference date if it is published late.
+- **Staleness limit:** a forward-filled value older than 5 calendar days becomes missing instead of a flat line.
+- **Truncation test:** delete the last rows and check no earlier value changes. Catches negative shifts and centred windows.
+- **Perturbation test:** scramble every input from row t on and check row t does not change. Catches same-day leaks too.
+- **Affine duplicate:** a feature that is just `a * other + b`, so it adds nothing new.
+- **Breadth:** the share of indices doing something (for example above their 50-day average) on a given day.
+- **Survivorship bias:** only seeing indices that still exist today.
+
 ## At a glance
 
 | | |
@@ -18,18 +47,32 @@ It started as feature work on two emerging-market index panels, which I audited 
 
 ## How it works
 
+```mermaid
+flowchart LR
+    A[per-index CSVs<br/>or synthetic.py] --> B[merge.py<br/>local spine, strict as-of foreign join,<br/>staleness limit, publication lags]
+    B --> C[pipeline.py<br/>10 modules in order]
+    C --> D[decision lag<br/>shift every column by 1]
+    D --> E[features<br/>row t uses data up to t-1]
+    E --> F[audit.py<br/>timing audit and duplicate checks]
 ```
-per-index CSVs ──► merge (local spine, strict as-of foreign join, publication lags) ──► 10 modules ──► decision lag ──► features
-                   merge.py                                                              pipeline.py
-```
+
+In plain text: per-index CSVs -> merge -> 10 modules -> decision lag -> features -> audit.
+
+Step by step:
+
+1. **Load.** Read one frame per index (`Date` plus OHLC or Close). With no `--csv-dir`, `synthetic.py` makes a panel with the same layout.
+2. **Merge.** Local indices are outer-merged on their own trading days. A foreign series is attached with a strict backward as-of join and a 5-day staleness limit. Publication-lagged series are shifted.
+3. **Features.** The ten modules below run in order. Index names come from the `*_Close` columns, never from code.
+4. **Decision lag.** Every generated column moves down one row.
+5. **Audit.** The script measures the two timing problems below and checks for duplicates.
 
 Modules, in order: `returns`, `moving_averages`, `distance_from_ma`, `volatility` (total, downside, upside), `rolling_statistics`, `momentum`, `relative_strength` (against the benchmark and the volatility index), `breadth`, `market_regime`, `technical_indicators` (RSI, MACD, ATR, ADX, CCI, Bollinger, Donchian, Keltner and stochastic, only where full OHLC exists). Every module is additive and never overwrites a column. Window sets live in `config.py`, with import-time assertions that stop one window set from silently duplicating another module's columns.
 
-## The timing audit
+## The timing audit (synthetic data)
 
 The original pipeline was already careful about row-level causality: trailing windows only, no negative shifts, and a truncation test. I found two timing problems that a truncation test cannot see, because neither involves reading a later row.
 
-`python scripts/build_features.py --market brazil` measures both on synthetic data. Each figure is the correlation with the benchmark's return over day t, on the same row:
+`python scripts/build_features.py --market brazil` measures both on synthetic data. These are not real-market numbers. Each figure is the correlation with the benchmark's return over day t, on the same row:
 
 | Problem | Original | Fixed |
 |---|---|---|
@@ -54,14 +97,18 @@ The original source contained no macro series, so there was no macro publication
 ## Repo layout
 
 ```
-src/emfeatures/   config.py · merge.py · pipeline.py · audit.py · synthetic.py · utils.py
+src/emfeatures/   config.py (MarketSpec, window sets) · merge.py · pipeline.py · audit.py · synthetic.py · utils.py
                   returns · moving_averages · distance_from_ma · volatility · rolling_statistics
-                  momentum · relative_strength · breadth · market_regime · technical_indicators
-scripts/          build_features.py
-tests/            truncation, perturbation, foreign join, staleness, publication lag, AST scan,
-                  bounded ranges, OHLC-only families, affine duplicates, data layout
-docs/             methodology.md
+                  momentum · relative_strength · breadth · market_regime · technical_indicators  (one .py each)
+scripts/          build_features.py (the CLI)
+tests/            conftest.py · test_leakage.py (truncation, perturbation, foreign join, staleness,
+                  publication lag, AST scan) · test_features.py (bounded ranges, OHLC-only families,
+                  affine duplicates, data layout)
+docs/             README.md (index) · methodology.md (method and timing audit)
+.github/          CI workflow
 ```
+
+There is no `original/` folder in this repo: the source data is third-party and the original code was merged into this package.
 
 ## Quick start
 
@@ -72,6 +119,8 @@ python scripts/build_features.py --market brazil
 python scripts/build_features.py --market india --no-audit
 python scripts/build_features.py --market india --csv-dir path/to/your/csvs --out results
 ```
+
+`path/to/your/csvs` is your own folder and nothing is shipped there. It must hold one `<NAME>.csv` per index, with a `Date` column plus `Open, High, Low, Close` or `Close` only. The file name becomes the index name. `--market` picks the `MarketSpec` in `config.py`, which names the benchmark and the volatility index (`NIFTY_50` and `INDIA_VIX` for `india`, `IBOV` and `VXEWZ` for `brazil`), so your file names should match it or you add your own spec. `--out` writes `features.csv.gz` (git-ignored). The build itself takes a few seconds; the audit on the `brazil` panel took about 40 s on my machine. `--no-audit` skips it.
 
 
 ## License
