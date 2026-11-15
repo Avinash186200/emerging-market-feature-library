@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+results/
+data/
+*.joblib
+*.db
+.env
+*.csv
+*.csv.gz
+*.parquet
+.ipynb_checkpoints/
